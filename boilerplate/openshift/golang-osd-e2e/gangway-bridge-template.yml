@@ -14,11 +14,11 @@ parameters:
     value: "7200"
     description: Maximum seconds to wait per attempt for job completion
   - name: MAX_RETRIES
-    value: "1"
+    value: "5"
     description: Number of times to retry the Prow job on failure before reporting failure
   - name: ACTIVE_DEADLINE
-    value: "14430"
-    description: Kubernetes Job deadline in seconds (should exceed TIMEOUT * (MAX_RETRIES + 1))
+    value: "50400"
+    description: Kubernetes Job deadline in seconds (must exceed all attempts plus backoff delays)
   - name: JOB_ENVS
     value: ""
     description: Comma-separated KEY=VALUE pairs passed to the Prow job
@@ -54,7 +54,9 @@ objects:
                   [[ "${POLL_INTERVAL}" =~ ^[1-9][0-9]*$ ]] || { log "ERROR: POLL_INTERVAL must be a positive integer"; exit 1; }
                   [[ "${MAX_RETRIES}" =~ ^[0-9]+$ ]] || { log "ERROR: MAX_RETRIES must be a non-negative integer"; exit 1; }
 
-                  REQUIRED_DEADLINE=$(( (MAX_RETRIES + 1) * TIMEOUT + (MAX_RETRIES * 30) ))
+                  # Backoff sum: base 30s doubling each retry = 30*(2^N-1), plus 15s max jitter per retry
+                  MAX_BACKOFF_SUM=$(( 30 * ((1 << MAX_RETRIES) - 1) + MAX_RETRIES * 15 ))
+                  REQUIRED_DEADLINE=$(( (MAX_RETRIES + 1) * TIMEOUT + MAX_BACKOFF_SUM ))
                   if [[ "${ACTIVE_DEADLINE}" -lt "${REQUIRED_DEADLINE}" ]]; then
                     log "ERROR: ACTIVE_DEADLINE (${ACTIVE_DEADLINE}s) is less than the minimum required for ${MAX_RETRIES} retries with TIMEOUT=${TIMEOUT}s (need at least ${REQUIRED_DEADLINE}s)"
                     exit 1
@@ -67,8 +69,46 @@ objects:
                   fi
 
                   trigger_and_poll() {
-                    if ! RESP=$(curl -sfSL --max-time 60 --retry 3 --retry-delay 10 -X POST -H "Authorization: Bearer ${GANGWAY_TOKEN}" -H "Content-Type: application/json" -d "${BODY}" "${GW}/${JOB_NAME}"); then
-                      log "Failed to trigger ${JOB_NAME}"
+                    # === TRIGGER ===
+                    # Use /dev/shm for temp files (writable tmpfs, works with readOnlyRootFilesystem)
+                    local resp_file="/dev/shm/gw_resp.$$" header_file="/dev/shm/gw_hdr.$$"
+                    trap 'rm -f "$resp_file" "$header_file"' RETURN
+
+                    # Capture HTTP code and headers separately so we can handle 429
+                    # Removed -f flag: we check the HTTP status ourselves
+                    HTTP_CODE=$(curl -sSL --max-time 60 --retry 3 --retry-delay 10 \
+                      -X POST \
+                      -H "Authorization: Bearer ${GANGWAY_TOKEN}" \
+                      -H "Content-Type: application/json" \
+                      -d "${BODY}" \
+                      -o "$resp_file" \
+                      -D "$header_file" \
+                      -w '%{http_code}' \
+                      "${GW}/${JOB_NAME}" 2>/dev/null) || HTTP_CODE=000
+
+                    # Handle HTTP 429 Too Many Requests (rate limiting)
+                    if [[ "$HTTP_CODE" == "429" ]]; then
+                      local retry_after
+                      retry_after=$(grep -i '^retry-after:' "$header_file" 2>/dev/null \
+                        | head -1 | tr -d '\r' | awk '{print $2}') || true
+                      if [[ -n "${retry_after:-}" && "${retry_after}" =~ ^[0-9]+$ ]]; then
+                        [[ "${retry_after}" -gt 600 ]] && retry_after=600
+                        log "Rate limited (429). Sleeping for Retry-After: ${retry_after}s"
+                        sleep "${retry_after}"
+                      else
+                        log "Rate limited (429). No valid Retry-After header, using backoff."
+                      fi
+                      return 1
+                    fi
+
+                    # Fail on non-2xx HTTP responses
+                    if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
+                      log "Failed to trigger ${JOB_NAME} (HTTP ${HTTP_CODE})"
+                      return 1
+                    fi
+
+                    if ! RESP=$(cat "$resp_file"); then
+                      log "Failed to read trigger response"
                       return 1
                     fi
                     if ! ID=$(echo "$RESP" | jq -re .id); then
@@ -79,6 +119,7 @@ objects:
                     log "Triggered ${JOB_NAME} -> ${ID}"
                     log "Prow logs: ${PROW_URL}"
 
+                    # === POLL (unchanged) ===
                     END=$((SECONDS + ${TIMEOUT}))
                     while [[ $SECONDS -lt $END ]]; do
                       sleep "${POLL_INTERVAL}"
@@ -104,8 +145,12 @@ objects:
                       log "All attempts exhausted"
                       exit 1
                     fi
-                    log "Retrying in 30s..."
-                    sleep 30
+                    # Exponential backoff: 30s base, doubling each retry, plus random jitter 0-15s
+                    BACKOFF=$(( 30 * (1 << (ATTEMPT - 1)) ))
+                    JITTER=$(( RANDOM % 16 ))
+                    DELAY=$(( BACKOFF + JITTER ))
+                    log "Retrying in ${DELAY}s (backoff=${BACKOFF}s, jitter=${JITTER}s)..."
+                    sleep "${DELAY}"
                   done
               env:
                 - name: JOB_NAME
